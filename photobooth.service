@@ -1,0 +1,24 @@
+[Unit]
+Description=Photobooth capture app
+After=multi-user.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+# rpi_ws281x needs /dev/mem access for PWM DMA -> must run as root
+User=root
+Environment=PHOTOBOOTH_DIR=/home/pi/photobooth/photos
+# Render to the PiTFT framebuffer. If you chose the Adafruit "mirror" install
+# (fbcp), you can instead leave both of these unset and pygame will render to
+# HDMI, which fbcp copies to the TFT.
+Environment=SDL_VIDEODRIVER=fbcon
+Environment=SDL_FBDEV=/dev/fb1
+# kmsdrm lets pygame draw directly to the framebuffer / DRM without X
+Environment=SDL_VIDEODRIVER=kmsdrm
+WorkingDirectory=/home/pi/photobooth
+ExecStart=/usr/bin/python3 /home/pi/photobooth/photobooth.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

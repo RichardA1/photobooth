@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photobooth Gallery</title>
+<style>
+  :root {
+    --bg: #111;
+    --fg: #eee;
+    --accent: #ff2d75;
+    --card: #1c1c1c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--fg); }
+  header { position: sticky; top: 0; background: var(--bg); padding: 16px 20px;
+           border-bottom: 1px solid #2a2a2a; display: flex; align-items: center; gap: 12px; }
+  header h1 { margin: 0; font-size: 20px; flex: 1; }
+  .btn { background: var(--accent); color: #fff; padding: 10px 16px; border-radius: 8px;
+         text-decoration: none; font-weight: 600; font-size: 14px; }
+  .btn.secondary { background: #333; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+          gap: 8px; padding: 12px; }
+  .card { background: var(--card); border-radius: 10px; overflow: hidden; position: relative; }
+  .card img { width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block; }
+  .card .meta { padding: 8px 10px; font-size: 12px; color: #aaa; display: flex;
+                justify-content: space-between; }
+  .card a.dl { position: absolute; right: 6px; top: 6px; background: rgba(0,0,0,.55);
+               color: #fff; padding: 4px 8px; border-radius: 6px; font-size: 12px;
+               text-decoration: none; }
+  .empty { padding: 40px; text-align: center; color: #888; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📸 Photobooth</h1>
+  {% if photos %}
+    <a class="btn" href="/download-all">Download all ({{ photos|length }})</a>
+  {% endif %}
+</header>
+
+{% if not photos %}
+  <div class="empty">No photos yet — go smash that button.</div>
+{% else %}
+  <div class="grid">
+    {% for p in photos %}
+      <div class="card">
+        <a href="/photo/{{ p.name }}" target="_blank">
+          <img src="/photo/{{ p.name }}" loading="lazy" alt="{{ p.name }}">
+        </a>
+        <a class="dl" href="/download/{{ p.name }}">⬇</a>
+        <div class="meta"><span>{{ p.when }}</span><span>{{ p.size_kb }} KB</span></div>
+      </div>
+    {% endfor %}
+  </div>
+{% endif %}
+</body>
+</html>
