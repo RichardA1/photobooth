@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Photobooth - live preview + countdown + capture on a Pi with TFT display.
+Photobooth - unified capture + web UI.
 
-Hardware:
-  - Raspberry Pi 3 (or newer)
-  - Pi Camera (any generation supported by libcamera / picamera2)
-  - TFT display configured as primary framebuffer
-  - Trigger button between GPIO_BUTTON and GND
-  - NeoPixel ring on GPIO 18 (PWM) - primary "flash" / modeling light
-  - Optional secondary flash trigger on GPIO_FLASH (drive an opto/MOSFET/relay)
+- Live MJPEG preview served over HTTP
+- "Take Photo" button in browser triggers countdown + capture
+- Physical button on GPIO 17 does the same
+- NeoPixel ring flash (idle rainbow, countdown pulse, capture blast, review breath)
+- Optional GPIO 5 secondary flash trigger (opto/MOSFET/SSR)
+- Gallery with per-photo download + zip-all
 """
 
+import io
 import os
 import sys
 import time
@@ -18,36 +18,42 @@ import math
 import signal
 import logging
 import threading
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from threading import Condition
 
-import pygame
+from flask import (
+    Flask, render_template, send_from_directory, send_file, abort,
+    Response, jsonify,
+)
 from gpiozero import Button, DigitalOutputDevice
 from picamera2 import Picamera2
+from picamera2.encoders import MJPEGEncoder
+from picamera2.outputs import FileOutput
 from rpi_ws281x import PixelStrip, Color
 
 # ---------- Configuration -------------------------------------------------
 
 PHOTO_DIR      = Path(os.environ.get("PHOTOBOOTH_DIR", "/home/pi/photobooth/photos"))
-GPIO_BUTTON    = 17          # matches PiTFT tactile switch pad #1
-GPIO_FLASH     = 5           # secondary flash trigger (opto / MOSFET / SSR)
-COUNTDOWN_FROM = 3           # seconds
-FLASH_MS       = 120         # secondary flash pulse length in ms
-CAPTURE_HOLD_S = 0.35        # how long the ring stays full-white during capture
-CAPTURE_SIZE   = (3280, 2464)   # Pi Cam v2.1 (IMX219) native 8MP
+GPIO_BUTTON    = 17          # PiTFT tactile pad #1 (or any external button to GND)
+GPIO_FLASH     = 5           # optional secondary flash trigger
+COUNTDOWN_FROM = 3
+FLASH_MS       = 120
+CAPTURE_HOLD_S = 0.35
+STILL_SIZE     = (2028, 1520)   # IMX219 binned mode, ~3 MP, fast on Pi 3
 PREVIEW_SIZE   = (640, 480)
-FPS            = 30
-FONT_NAME      = None
 DEBOUNCE_S     = 0.3
+WEB_PORT       = 80
 
 # NeoPixel ring
-NEOPIXEL_COUNT       = 16    # 12 / 16 / 24
-NEOPIXEL_PIN         = 12    # PWM0 alternate (GPIO 18 is taken by PiTFT backlight)
-NEOPIXEL_FREQ_HZ     = 800_000
-NEOPIXEL_DMA         = 10
-NEOPIXEL_BRIGHTNESS  = 255   # 0-255, overall cap; per-mode brightness is scaled below
-NEOPIXEL_INVERT      = False
-NEOPIXEL_CHANNEL     = 0
+NEOPIXEL_COUNT      = 16
+NEOPIXEL_PIN        = 12     # PWM0 alt (GPIO 18 is taken by PiTFT backlight)
+NEOPIXEL_FREQ_HZ    = 800_000
+NEOPIXEL_DMA        = 10
+NEOPIXEL_BRIGHTNESS = 255
+NEOPIXEL_INVERT     = False
+NEOPIXEL_CHANNEL    = 0
 
 # ---------- Logging -------------------------------------------------------
 
@@ -56,20 +62,24 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("photobooth")
 
 
-# ---------- NeoPixel flash / mood ring ------------------------------------
+# ---------- MJPEG streaming buffer ---------------------------------------
+
+class StreamingOutput(io.BufferedIOBase):
+    """picamera2 FileOutput target that holds the most recent JPEG frame."""
+
+    def __init__(self):
+        self.frame = None
+        self.condition = Condition()
+
+    def write(self, buf):
+        with self.condition:
+            self.frame = buf
+            self.condition.notify_all()
+
+
+# ---------- NeoPixel flash / mood ring -----------------------------------
 
 class FlashRing:
-    """
-    Background thread that animates a NeoPixel ring based on `mode`.
-
-    Modes:
-      idle       - slow rainbow chase, ~30% brightness
-      countdown  - pulses that get brighter/whiter as the count drops
-      capture    - solid full-white blast
-      review     - gentle breathing white while the last photo is shown
-      off        - all pixels dark
-    """
-
     def __init__(self):
         self.strip = PixelStrip(
             NEOPIXEL_COUNT, NEOPIXEL_PIN, NEOPIXEL_FREQ_HZ,
@@ -78,7 +88,7 @@ class FlashRing:
         )
         self.strip.begin()
         self.mode = "idle"
-        self.countdown_step = COUNTDOWN_FROM  # updated by capture sequence
+        self.countdown_step = COUNTDOWN_FROM
         self._running = True
         self._t0 = time.monotonic()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -95,8 +105,6 @@ class FlashRing:
         self._fill(0, 0, 0)
         self.strip.show()
 
-    # --- helpers -----------------------------------------------------
-
     def _fill(self, r, g, b):
         c = Color(int(r), int(g), int(b))
         for i in range(NEOPIXEL_COUNT):
@@ -104,7 +112,6 @@ class FlashRing:
 
     @staticmethod
     def _wheel(pos):
-        """0-255 -> RGB rainbow."""
         pos = pos % 256
         if pos < 85:
             return (pos * 3, 255 - pos * 3, 0)
@@ -114,10 +121,7 @@ class FlashRing:
         pos -= 170
         return (0, pos * 3, 255 - pos * 3)
 
-    # --- animations --------------------------------------------------
-
     def _anim_idle(self, t):
-        # Rainbow chase, moderate brightness
         scale = 0.30
         offset = int(t * 40) & 0xFF
         for i in range(NEOPIXEL_COUNT):
@@ -127,16 +131,12 @@ class FlashRing:
                                               int(b * scale)))
 
     def _anim_countdown(self, t):
-        # As countdown_step goes 3 -> 2 -> 1, ramp brightness and shift
-        # color from warm amber toward white. Pulse within each second.
         max_step = COUNTDOWN_FROM
         step = max(1, self.countdown_step)
-        progress = 1.0 - (step - 1) / max_step   # 0..1 through the countdown
-        # 2 Hz pulse
+        progress = 1.0 - (step - 1) / max_step
         pulse = 0.5 + 0.5 * math.sin(t * 2 * math.pi * 2)
-        base = 0.35 + 0.55 * progress            # brightness floor rises
+        base = 0.35 + 0.55 * progress
         level = base * (0.7 + 0.3 * pulse)
-        # Color: amber (255, 140, 40) -> white (255, 255, 255)
         r = 255
         g = int(140 + (255 - 140) * progress)
         b = int(40  + (255 - 40)  * progress)
@@ -146,7 +146,6 @@ class FlashRing:
         self._fill(255, 255, 255)
 
     def _anim_review(self, t):
-        # Gentle breathing white
         level = 0.15 + 0.15 * (0.5 + 0.5 * math.sin(t * 2 * math.pi * 0.5))
         v = int(255 * level)
         self._fill(v, v, v)
@@ -166,105 +165,189 @@ class FlashRing:
             t = time.monotonic() - self._t0
             anims.get(self.mode, self._anim_idle)(t)
             self.strip.show()
-            time.sleep(1 / 60)  # ~60 fps ring updates
+            time.sleep(1 / 60)
 
 
-# ---------- Main app ------------------------------------------------------
+# ---------- Main app -----------------------------------------------------
 
 class Photobooth:
     def __init__(self):
         PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 
-        # --- Display ---------------------------------------------------
-        # SDL_VIDEODRIVER is provided via systemd (or the shell). Typical
-        # values on the PiTFT:
-        #   - fbcp mirror mode: leave unset (uses default) or "kmsdrm"
-        #   - Adafruit "console" install: SDL_VIDEODRIVER=fbcon SDL_FBDEV=/dev/fb1
-        pygame.init()
-        pygame.mouse.set_visible(False)
-        self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-        self.w, self.h = self.screen.get_size()
-        log.info("Display: %dx%d", self.w, self.h)
-
-        self.font_big   = pygame.font.Font(FONT_NAME, max(48, self.h // 3))
-        self.font_small = pygame.font.Font(FONT_NAME, max(14, self.h // 20))
-
-        # --- Camera ----------------------------------------------------
+        # --- Camera ---------------------------------------------------
         self.cam = Picamera2()
-        cfg = self.cam.create_still_configuration(
-            main={"size": CAPTURE_SIZE, "format": "RGB888"},
-            lores={"size": PREVIEW_SIZE, "format": "RGB888"},
-            display=None,
-            buffer_count=3,
+        config = self.cam.create_video_configuration(
+            main={"size": STILL_SIZE, "format": "RGB888"},
+            lores={"size": PREVIEW_SIZE, "format": "YUV420"},
+            buffer_count=4,
         )
-        self.cam.configure(cfg)
-        self.cam.start()
-        time.sleep(0.5)
+        self.cam.configure(config)
 
-        # --- GPIO ------------------------------------------------------
+        # Start hardware MJPEG encoder on the lores stream. Frames flow
+        # into self.stream_output continuously; Flask serves the latest.
+        self.stream_output = StreamingOutput()
+        self.cam.start_recording(
+            MJPEGEncoder(),
+            FileOutput(self.stream_output),
+            name="lores",
+        )
+        time.sleep(0.5)  # AE/AWB warm-up
+
+        # --- GPIO -----------------------------------------------------
         self.button = Button(GPIO_BUTTON, pull_up=True, bounce_time=DEBOUNCE_S)
         self.flash_trigger = DigitalOutputDevice(GPIO_FLASH, active_high=True,
                                                  initial_value=False)
         self.button.when_pressed = self._on_button
 
-        # --- NeoPixel ring --------------------------------------------
+        # --- Ring -----------------------------------------------------
         self.ring = FlashRing()
         self.ring.set_mode("idle")
 
-        # --- State -----------------------------------------------------
+        # --- State ----------------------------------------------------
         self.state_lock = threading.Lock()
-        self.capturing  = False
-        self.last_photo = None
-        self.last_photo_until = 0
-        self._countdown_value = None
-        self.running = True
+        self.capturing = False
+        self.state = "idle"          # idle | countdown | capture | review
+        self.countdown_value = None  # "3" | "2" | "1" | "SMILE!" | None
+        self.last_photo_name = None
+        self.review_until = 0.0
 
-        signal.signal(signal.SIGTERM, lambda *a: self.stop())
-        signal.signal(signal.SIGINT,  lambda *a: self.stop())
+        # --- Flask ----------------------------------------------------
+        self.app = Flask(__name__)
+        self._setup_routes()
 
     # ------------------------------------------------------------------
 
-    def stop(self):
-        log.info("Shutting down...")
-        self.running = False
+    def _setup_routes(self):
+        app = self.app
+
+        @app.route("/")
+        def index():
+            return render_template("index.html", photos=self._list_photos())
+
+        @app.route("/stream.mjpg")
+        def stream():
+            def generate():
+                while True:
+                    with self.stream_output.condition:
+                        self.stream_output.condition.wait()
+                        frame = self.stream_output.frame
+                    if not frame:
+                        continue
+                    yield (b"--FRAME\r\n"
+                           b"Content-Type: image/jpeg\r\n"
+                           b"Content-Length: " + str(len(frame)).encode() +
+                           b"\r\n\r\n" + frame + b"\r\n")
+            return Response(generate(),
+                            mimetype="multipart/x-mixed-replace; boundary=FRAME")
+
+        @app.route("/status")
+        def status():
+            with self.state_lock:
+                if self.state == "review" and time.monotonic() >= self.review_until:
+                    self.state = "idle"
+                return jsonify({
+                    "state": self.state,
+                    "countdown": self.countdown_value,
+                    "latest_photo": self.last_photo_name,
+                })
+
+        @app.route("/capture", methods=["POST"])
+        def capture():
+            triggered = self._on_button()
+            return jsonify({"triggered": triggered})
+
+        @app.route("/photo/<path:name>")
+        def photo(name):
+            return send_from_directory(PHOTO_DIR, name)
+
+        @app.route("/download/<path:name>")
+        def download(name):
+            return send_from_directory(PHOTO_DIR, name, as_attachment=True)
+
+        @app.route("/download-all")
+        def download_all():
+            photos = self._list_photos()
+            if not photos:
+                abort(404)
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for p in photos:
+                    z.write(PHOTO_DIR / p["name"], arcname=p["name"])
+            buf.seek(0)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            return send_file(buf, mimetype="application/zip",
+                             as_attachment=True,
+                             download_name=f"photobooth_{stamp}.zip")
+
+        @app.route("/gallery.json")
+        def gallery_json():
+            return jsonify(self._list_photos())
+
+    # ------------------------------------------------------------------
+
+    def _list_photos(self):
+        files = sorted(
+            (p for p in PHOTO_DIR.iterdir()
+             if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return [
+            {"name": p.name,
+             "size_kb": p.stat().st_size // 1024,
+             "when": datetime.fromtimestamp(p.stat().st_mtime).strftime("%b %d, %H:%M")}
+            for p in files
+        ]
+
+    # ------------------------------------------------------------------
 
     def _on_button(self):
         with self.state_lock:
             if self.capturing:
-                return
+                return False
             self.capturing = True
         threading.Thread(target=self._capture_sequence, daemon=True).start()
-
-    # ------------------------------------------------------------------
+        return True
 
     def _capture_sequence(self):
         try:
-            self._countdown()
+            with self.state_lock:
+                self.state = "countdown"
+
+            for n in range(COUNTDOWN_FROM, 0, -1):
+                with self.state_lock:
+                    self.countdown_value = str(n)
+                self.ring.set_mode("countdown", countdown_step=n)
+                time.sleep(1.0)
+
+            with self.state_lock:
+                self.countdown_value = "SMILE!"
+            time.sleep(0.3)
+
             self._fire_flash_async()
             self.ring.set_mode("capture")
+            with self.state_lock:
+                self.state = "capture"
+                self.countdown_value = None
+
             path = self._capture_still()
-            # Hold the white for a beat so the ring actually lights the shot
             time.sleep(CAPTURE_HOLD_S)
             self.ring.set_mode("review")
-            self._show_result(path)
+
+            with self.state_lock:
+                self.state = "review"
+                self.last_photo_name = path.name
+                self.review_until = time.monotonic() + 2.5
+
+            time.sleep(2.5)
         except Exception:
             log.exception("Capture sequence failed")
         finally:
-            # Wait out the review window before going back to idle animation
-            while self.last_photo and time.monotonic() < self.last_photo_until:
-                time.sleep(0.05)
-            self.ring.set_mode("idle")
             with self.state_lock:
+                self.state = "idle"
+                self.countdown_value = None
                 self.capturing = False
-
-    def _countdown(self):
-        for n in range(COUNTDOWN_FROM, 0, -1):
-            self._countdown_value = str(n)
-            self.ring.set_mode("countdown", countdown_step=n)
-            time.sleep(1.0)
-        self._countdown_value = "SMILE!"
-        time.sleep(0.3)
-        self._countdown_value = None
+            self.ring.set_mode("idle")
 
     def _fire_flash_async(self):
         def pulse():
@@ -276,82 +359,34 @@ class Photobooth:
     def _capture_still(self):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = PHOTO_DIR / f"photo_{ts}.jpg"
-        self.cam.capture_file(str(path), name="main")
+        request = self.cam.capture_request()
+        request.save("main", str(path))
+        request.release()
         log.info("Saved %s", path)
         return path
-
-    def _show_result(self, path):
-        try:
-            img = pygame.image.load(str(path))
-            img = pygame.transform.scale(img, (self.w, self.h))
-            self.last_photo = img
-            self.last_photo_until = time.monotonic() + 2.5
-        except Exception:
-            log.exception("Could not load %s for preview", path)
-
-    # ------------------------------------------------------------------
-
-    def _draw_preview_frame(self):
-        frame = self.cam.capture_array("lores")
-        surf = pygame.image.frombuffer(frame.tobytes(),
-                                       (frame.shape[1], frame.shape[0]),
-                                       "RGB")
-        surf = pygame.transform.scale(surf, (self.w, self.h))
-        self.screen.blit(surf, (0, 0))
-
-    def _draw_countdown(self):
-        val = self._countdown_value
-        if not val:
-            return
-        text   = self.font_big.render(val, True, (255, 255, 255))
-        shadow = self.font_big.render(val, True, (0, 0, 0))
-        rect = text.get_rect(center=(self.w // 2, self.h // 2))
-        self.screen.blit(shadow, rect.move(4, 4))
-        self.screen.blit(text, rect)
-
-    def _draw_idle_hint(self):
-        if self.capturing:
-            return
-        msg = "Press the button to take a photo"
-        text   = self.font_small.render(msg, True, (255, 255, 255))
-        shadow = self.font_small.render(msg, True, (0, 0, 0))
-        rect = text.get_rect(midbottom=(self.w // 2, self.h - 20))
-        self.screen.blit(shadow, rect.move(2, 2))
-        self.screen.blit(text, rect)
 
     # ------------------------------------------------------------------
 
     def run(self):
-        clock = pygame.time.Clock()
-        log.info("Photobooth ready. Waiting for button on GPIO %d.", GPIO_BUTTON)
-        while self.running:
-            for ev in pygame.event.get():
-                if ev.type == pygame.QUIT:
-                    self.stop()
-                elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                    self.stop()
-                elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_SPACE:
-                    self._on_button()
+        signal.signal(signal.SIGTERM, lambda *a: self.shutdown())
+        signal.signal(signal.SIGINT, lambda *a: self.shutdown())
+        log.info("Photobooth ready. Button GPIO %d, web on port %d.",
+                 GPIO_BUTTON, WEB_PORT)
+        self.app.run(host="0.0.0.0", port=WEB_PORT,
+                     threaded=True, use_reloader=False)
 
-            if self.last_photo and time.monotonic() < self.last_photo_until:
-                self.screen.blit(self.last_photo, (0, 0))
-            else:
-                self.last_photo = None
-                self._draw_preview_frame()
-                self._draw_countdown()
-                self._draw_idle_hint()
-
-            pygame.display.flip()
-            clock.tick(FPS)
-
-        # Cleanup
+    def shutdown(self):
+        log.info("Shutting down...")
         try:
-            self.cam.stop()
+            self.cam.stop_recording()
         except Exception:
             pass
         self.flash_trigger.off()
-        self.ring.stop()
-        pygame.quit()
+        try:
+            self.ring.stop()
+        except Exception:
+            pass
+        sys.exit(0)
 
 
 if __name__ == "__main__":
